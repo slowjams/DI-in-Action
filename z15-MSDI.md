@@ -26,7 +26,8 @@ public class ServiceDescriptor {
    public ServiceLifetime Lifetime { get; }
    public Type ServiceType { get; }
    public Type ImplementationType { get; }
-   public object ImplementationInstance { get; }
+   public object ImplementationInstance { get; }   // if you don't provde an instance for singleton, I mean the singleton will be created on the runtime 
+                                                   // when you first access this service
    public Func<IServiceProvider, object> ImplementationFactory { get; }
 
    internal Type GetImplementationType() {
@@ -182,7 +183,8 @@ public sealed class ServiceProvider : IServiceProvider, IDisposable, IServicePro
    private readonly IServiceProviderEngine _engine;
    private readonly CallSiteValidator _callSiteValidator;
    
-   internal ServiceProvider(IEnumerable<ServiceDescriptor> serviceDescriptors, ServiceProviderOptions options) {   // serviceDescriptors is actually ServiceCollection
+                                                      // serviceDescriptors is actually ServiceCollection
+   internal ServiceProvider(IEnumerable<ServiceDescriptor> serviceDescriptors, ServiceProviderOptions options) {   /
       IServiceProviderEngineCallback callback = null;
       if (options.ValidateScopes) {
          callback = this;   // pass itself to ServiceProviderEngine
@@ -216,7 +218,7 @@ public sealed class ServiceProvider : IServiceProvider, IDisposable, IServicePro
    }
 
    void IServiceProviderEngineCallback.OnResolve(Type serviceType, IServiceScope scope) {
-       _callSiteValidator.ValidateResolution(serviceType, scope, _engine.RootScope);
+       _callSiteValidator.ValidateResolution(serviceType, scope, _engine.RootScope);  // I think this is about how a specific scope resolve a singleton service
    }
 }
 
@@ -228,7 +230,8 @@ internal abstract class ServiceProviderEngine : IServiceProviderEngine, IService
    protected ServiceProviderEngine(IEnumerable<ServiceDescriptor> serviceDescriptors, IServiceProviderEngineCallback callback) {  // callback is actually ServiceProvider
       _createServiceAccessor = CreateServiceAccessor;
       _callback = callback;
-      Root = new ServiceProviderEngineScope(this);   // root scope, represented by a new ServiceProviderEngineScope instance with ServiceProviderEngine instance
+      Root = new ServiceProviderEngineScope(this);   // root scope, represented by a new ServiceProviderEngineScope instance with ServiceProviderEngine itself
+                                                     // so root scope is created by ServiceProviderEngine you can say
       RuntimeResolver = new CallSiteRuntimeResolver();
       CallSiteFactory = new CallSiteFactory(serviceDescriptors);
       CallSiteFactory.Add(typeof(IServiceProvider), new ServiceProviderCallSite());
@@ -236,13 +239,15 @@ internal abstract class ServiceProviderEngine : IServiceProviderEngine, IService
       RealizedServices = new ConcurrentDictionary<Type, Func<ServiceProviderEngineScope, object>>();
    }
 
-   internal ConcurrentDictionary<Type, Func<ServiceProviderEngineScope, object>> RealizedServices { get; }  // use ConcurrentDictionary multithreading purose I think
+   // use ConcurrentDictionary multithreading purose I think
+   internal ConcurrentDictionary<Type, Func<ServiceProviderEngineScope, object>> RealizedServices { get; }  
 
    internal CallSiteFactory CallSiteFactory { get; }
    protected CallSiteRuntimeResolver RuntimeResolver { get; }
    public ServiceProviderEngineScope Root { get; }
    public IServiceScope RootScope => Root;
-   public object GetService(Type serviceType) => GetService(serviceType, Root);   // get service from root scope
+   public object GetService(Type serviceType) => GetService(serviceType, Root);   // get service from root scope; note that one argument means resolve from 
+                                                                                  // root container; two arguments means resolve from a specific scope
 
    internal object GetService(Type serviceType, ServiceProviderEngineScope serviceProviderEngineScope) {   // get service from scope
       if (_disposed)
@@ -302,14 +307,13 @@ internal class ServiceProviderEngineScope : IServiceScope, IServiceProvider {   
    public object GetService(Type serviceType) {
       if (_disposed)
          ThrowHelper.ThrowObjectDisposedException();
-      return Engine.GetService(serviceType, this);   // engine finds the service in a specified scope
+      return Engine.GetService(serviceType, this);   // asks engine finds the service in a specified scope
    }
 
    public IServiceProvider ServiceProvider => this;  // it returns itself so it can be used as: scope.ServiceProvider.GetRequiredService<SauceBéarnaise>();
                                                      // but why adds extra step? why we need to call `scope.ServiceProvider.GetServices<IIngredient>();`? 
                                                      // why not just `scope.GetServices<IIngredient>()`?
                                                      
-
    public void Dispose() {
       lock (ResolvedServices) {
          if (_disposed) {
@@ -344,6 +348,52 @@ internal class ServiceProviderEngineScope : IServiceScope, IServiceProvider {   
    }
 }
 ```
+There are two important things to notice:
+
+1. Both `ServiceProvider` and `ServiceProviderEngineScope` implement `IServiceProvider`:
+
+```C#
+public interface IServiceProvider {
+   object GetService(Type serviceType);
+}
+
+public sealed class ServiceProvider : IServiceProvider, IDisposable, IServiceProviderEngineCallback {
+   ...
+}
+internal class ServiceProviderEngineScope : IServiceScope, IServiceProvider { 
+   ...
+}
+```
+so why we call `ServiceProvider` root container, what makes it a root container?
+The answer is how they asks Engine to resolve services. For `ServiceProvider`, it does `public object GetService(Type serviceType) => _engine.GetService(serviceType);`; for `ServiceProviderEngineScope`, it does `Engine.GetService(serviceType, this);`, if you look at the Engine source code:
+```C#
+internal abstract class ServiceProviderEngine : IServiceProviderEngine ... {
+   ...
+   public ServiceProviderEngineScope Root { get; }
+   public IServiceScope RootScope => Root;
+
+   public object GetService(Type serviceType) => GetService(serviceType, Root);
+   internal object GetService(Type serviceType, ServiceProviderEngineScope serviceProviderEngineScope) { ... }
+}
+```
+See `ServiceProvider` eventually only pass one argument to `GetService` and `ServiceProviderEngineScope` pass two arguments to `GetService`, now you see why `ServiceProvider` is root container :)
+
+2. From the source code you can see that `ServiceProviderEngineScope` is actually an `IServiceProvider`, when you create multiple scopes from the roon container `ServiceProvider`, you actually create multiple `ServiceProviderEngineScope` instances, and all those instances shared a same `ServiceProviderEngine` instance. Now you get the idea that when you access the `IServiceProvider` via `HttpContext`:
+```C#
+public abstract class HttpContext {
+   ...
+   public abstract HttpRequest Request { get; }
+
+   public abstract HttpResponse Response { get; }
+
+   public abstract IServiceProvider RequestServices { get; set; }  
+}
+```
+You actually gets an `ServiceProviderEngineScope` that asp.net core creates for the request.
+
+If you check the source code carefully, you might ask:
+`"How can the scope associated with a request resolves singleton service"?`
+becuase if you look at the code (`Engine.GetService(serviceType, this)`)", the scope is always passed as itself for the Engine to resolve service, it doesn't pass the the root scope obviously, so how does Engine resolve singleton service? I think it works in this way, Engine calls `_callback?.OnResolve(serviceType, serviceProviderEngineScope);` first where `_callback` is actually the root container ServiceProvider, then it eventually calls `_callSiteValidator.ValidateResolution(serviceType, scope, _engine.RootScope)`, since both the specific scope and root scope are passed, I think that's how a specific child scope resolves singleton instances. 
 
 <div class="alert alert-info pt-2 pb-0" role="alert">
    If you want to know the difference between GetService method and GetRequiredService (recommended to use) method, check this article: https://andrewlock.net/the-difference-between-getservice-and-getrquiredservice-in-asp-net-core/
